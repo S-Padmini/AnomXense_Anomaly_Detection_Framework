@@ -17,11 +17,23 @@ class DatasetSession:
     file_size: int
     dataframe: pd.DataFrame
     summary: dict[str, Any]
+
     selected_columns: list[str]
+
     confirmed: bool = False
+
     preprocessed_df: pd.DataFrame | None = None
     preprocess_result: dict[str, Any] | None = None
     statistical_result: dict[str, Any] | None = None
+
+    # ---------------------------------------------------------------
+    # PHASE 4
+    # ---------------------------------------------------------------
+
+    phase4_objective: dict[str, Any] | None = None
+    phase4_recommendations: list[dict[str, Any]] | None = None
+    phase4_confirmed: bool = False
+
     created_at: float = 0.0
     last_accessed: float = 0.0
 
@@ -32,47 +44,102 @@ class DatasetSession:
 class DatasetStore:
     """Small in-memory session store for local development.
 
-    A production deployment with multiple workers should use shared storage
-    (Redis/database/object storage) instead.
+    A production deployment with multiple workers should use shared
+    storage such as Redis, a database, or object storage.
     """
 
-    def __init__(self, ttl_seconds: int | None = None) -> None:
-        self._sessions: dict[str, DatasetSession] = {}
-        self._lock = RLock()
-        self.ttl_seconds = ttl_seconds or int(os.getenv("DATASET_SESSION_TTL_SECONDS", "3600"))
+    def __init__(
+        self,
+        ttl_seconds: int | None = None,
+    ) -> None:
 
-    def create(self, *, filename: str, file_size: int, dataframe: pd.DataFrame,
-               summary: dict[str, Any]) -> DatasetSession:
+        self._sessions: dict[
+            str,
+            DatasetSession,
+        ] = {}
+
+        self._lock = RLock()
+
+        self.ttl_seconds = (
+            ttl_seconds
+            or int(
+                os.getenv(
+                    "DATASET_SESSION_TTL_SECONDS",
+                    "3600",
+                )
+            )
+        )
+
+    def create(
+        self,
+        *,
+        filename: str,
+        file_size: int,
+        dataframe: pd.DataFrame,
+        summary: dict[str, Any],
+    ) -> DatasetSession:
+
         dataset_id = uuid.uuid4().hex
         now = time.time()
+
         session = DatasetSession(
             dataset_id=dataset_id,
             filename=filename,
             file_size=file_size,
             dataframe=dataframe,
             summary=summary,
-            selected_columns=[str(c) for c in dataframe.columns],
+            selected_columns=[
+                str(c)
+                for c in dataframe.columns
+            ],
             created_at=now,
             last_accessed=now,
         )
+
         with self._lock:
             self._cleanup_locked()
             self._sessions[dataset_id] = session
+
         return session
 
-    def get(self, dataset_id: str) -> DatasetSession:
+    def get(
+        self,
+        dataset_id: str,
+    ) -> DatasetSession:
+
         with self._lock:
             self._cleanup_locked()
-            session = self._sessions.get(dataset_id)
+
+            session = self._sessions.get(
+                dataset_id
+            )
+
             if session is None:
                 raise KeyError(dataset_id)
+
             session.touch()
+
             return session
 
     def _cleanup_locked(self) -> None:
-        cutoff = time.time() - self.ttl_seconds
-        for key in [k for k, v in self._sessions.items() if v.last_accessed < cutoff]:
-            self._sessions.pop(key, None)
+
+        cutoff = (
+            time.time()
+            - self.ttl_seconds
+        )
+
+        expired = [
+            key
+            for key, value
+            in self._sessions.items()
+            if value.last_accessed < cutoff
+        ]
+
+        for key in expired:
+            self._sessions.pop(
+                key,
+                None,
+            )
 
 
 store = DatasetStore()
