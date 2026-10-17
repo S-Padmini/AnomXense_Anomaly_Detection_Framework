@@ -3,7 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 
-def _profile_type(profile: dict[str, Any]) -> str:
+# ============================================================
+# PROFILE HELPERS
+# ============================================================
+
+def _profile_type(
+    profile: dict[str, Any],
+) -> str:
+
     return str(
         profile.get("type")
         or profile.get("data_type")
@@ -12,22 +19,10 @@ def _profile_type(profile: dict[str, Any]) -> str:
     ).lower()
 
 
-def _is_numeric(profile: dict[str, Any]) -> bool:
-    value = _profile_type(profile)
+def _is_temporal(
+    profile: dict[str, Any],
+) -> bool:
 
-    return any(
-        token in value
-        for token in (
-            "int",
-            "float",
-            "double",
-            "decimal",
-            "numeric",
-        )
-    )
-
-
-def _is_temporal(profile: dict[str, Any]) -> bool:
     value = _profile_type(profile)
 
     return any(
@@ -41,12 +36,346 @@ def _is_temporal(profile: dict[str, Any]) -> bool:
     )
 
 
-def _safe_confidence(value: Any) -> float:
+def _safe_confidence(
+    value: Any,
+) -> float:
+
     try:
-        return max(0.0, min(1.0, float(value)))
+        return max(
+            0.0,
+            min(
+                1.0,
+                float(value),
+            ),
+        )
     except (TypeError, ValueError):
         return 0.0
 
+
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+def _deduplicate_columns(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+
+    result: dict[str, dict[str, Any]] = {}
+
+    for item in items:
+
+        column = item.get("column")
+
+        if not column:
+            continue
+
+        confidence = _safe_confidence(
+            item.get("confidence")
+        )
+
+        if (
+            column not in result
+            or confidence
+            > _safe_confidence(
+                result[column].get("confidence")
+            )
+        ):
+            result[column] = item
+
+    return list(
+        result.values()
+    )
+
+
+# ============================================================
+# ROLE VALIDATION
+# ============================================================
+
+def _validate_role(
+    *,
+    interpretation: dict[str, Any],
+    role: str,
+    selected_columns: set[str],
+) -> list[dict[str, Any]]:
+
+    valid: list[dict[str, Any]] = []
+
+    items = interpretation.get(
+        f"{role}_columns",
+        [],
+    )
+
+    if not isinstance(items, list):
+        return valid
+
+    for item in items:
+
+        if not isinstance(item, dict):
+            continue
+
+        column = str(
+            item.get(
+                "column",
+                "",
+            )
+        ).strip()
+
+        if not column:
+            continue
+
+        if column not in selected_columns:
+            continue
+
+        confidence = _safe_confidence(
+            item.get("confidence")
+        )
+
+        evidence = str(
+            item.get(
+                "evidence",
+                "",
+            )
+        ).strip()
+
+        valid.append(
+            {
+                "column": column,
+                "role": role,
+                "confidence": confidence,
+                "evidence": evidence,
+            }
+        )
+
+    return _deduplicate_columns(valid)
+
+
+# ============================================================
+# DETECTION COLUMN VALIDATION
+# ============================================================
+
+def _validate_detection_columns(
+    interpretation: dict[str, Any],
+    selected_columns: set[str],
+) -> list[dict[str, Any]]:
+
+    items = interpretation.get(
+        "target_columns",
+        [],
+    )
+
+    if not isinstance(items, list):
+        return []
+
+    valid: list[dict[str, Any]] = []
+
+    allowed_roles = {
+        "detection_feature",
+        "context_feature",
+        "entity_identifier",
+        "reference_feature",
+        "temporal_feature",
+    }
+
+    for item in items:
+
+        if not isinstance(item, dict):
+            continue
+
+        column = str(
+            item.get(
+                "column",
+                "",
+            )
+        ).strip()
+
+        if not column:
+            continue
+
+        if column not in selected_columns:
+            continue
+
+        confidence = _safe_confidence(
+            item.get("confidence")
+        )
+
+        evidence = str(
+            item.get(
+                "evidence",
+                "",
+            )
+        ).strip()
+
+        role = str(
+            item.get(
+                "role",
+                "detection_feature",
+            )
+        ).strip().lower()
+
+        if role not in allowed_roles:
+            role = "detection_feature"
+
+        valid.append(
+            {
+                "column": column,
+                "role": role,
+                "confidence": confidence,
+                "evidence": evidence,
+            }
+        )
+
+    return _deduplicate_columns(valid)
+
+
+# ============================================================
+# OBJECTIVE ATTRIBUTE EXTRACTION
+# ============================================================
+
+def _objective_attributes(
+    interpretation: dict[str, Any],
+) -> list[dict[str, Any]]:
+
+    items = interpretation.get(
+        "attributes_involved",
+        [],
+    )
+
+    if not isinstance(items, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+
+    for item in items:
+
+        if isinstance(item, str):
+
+            column = item.strip()
+
+            if not column:
+                continue
+
+            result.append(
+                {
+                    "column": column,
+                    "role": "supporting_feature",
+                    "confidence": 0.0,
+                    "reason": "",
+                }
+            )
+
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        column = str(
+            item.get("column")
+            or item.get("name")
+            or item.get("column_name")
+            or ""
+        ).strip()
+
+        if not column:
+            continue
+
+        role = str(
+            item.get(
+                "role",
+                "supporting_feature",
+            )
+        ).strip().lower()
+
+        role_aliases = {
+            "target": "detection_feature",
+            "detection": "detection_feature",
+            "detection_feature": "detection_feature",
+            "entity": "entity_identifier",
+            "entity_identifier": "entity_identifier",
+            "reference": "reference_feature",
+            "reference_feature": "reference_feature",
+            "context": "context_feature",
+            "context_feature": "context_feature",
+            "temporal": "temporal_feature",
+            "temporal_feature": "temporal_feature",
+            "supporting": "supporting_feature",
+            "supporting_feature": "supporting_feature",
+        }
+
+        role = role_aliases.get(
+            role,
+            "supporting_feature",
+        )
+
+        result.append(
+            {
+                "column": column,
+                "role": role,
+                "confidence": _safe_confidence(
+                    item.get("confidence")
+                ),
+                "reason": str(
+                    item.get("reason")
+                    or item.get("evidence")
+                    or item.get("explanation")
+                    or item.get("why_relevant")
+                    or ""
+                ).strip(),
+            }
+        )
+
+    return _deduplicate_columns(result)
+
+
+# ============================================================
+# ATTRIBUTE SELECTION VALIDATION
+# ============================================================
+
+def _validate_attribute_selection(
+    *,
+    interpretation: dict[str, Any],
+    selected_columns: list[str],
+) -> tuple[
+    list[dict[str, Any]],
+    list[str],
+    bool,
+]:
+
+    selected_set = {
+        str(column).strip()
+        for column in selected_columns
+        if str(column).strip()
+    }
+
+    objective_attributes = _objective_attributes(
+        interpretation
+    )
+
+    missing: list[str] = []
+
+    for item in objective_attributes:
+
+        column = item.get("column")
+
+        if not column:
+            continue
+
+        if column not in selected_set:
+            missing.append(column)
+
+    missing = list(
+        dict.fromkeys(missing)
+    )
+
+    return (
+        objective_attributes,
+        missing,
+        len(missing) == 0,
+    )
+
+
+# ============================================================
+# MAIN VALIDATION
+# ============================================================
 
 def validate_objective_match(
     *,
@@ -56,190 +385,317 @@ def validate_objective_match(
     phase3_statistics: dict[str, Any],
 ) -> dict[str, Any]:
 
-    selected = set(selected_columns)
+    selected = set(
+        selected_columns
+    )
 
     warnings = list(
-        interpretation.get("warnings", [])
+        interpretation.get(
+            "warnings",
+            [],
+        )
     )
 
     assumptions = list(
-        interpretation.get("assumptions", [])
+        interpretation.get(
+            "assumptions",
+            [],
+        )
     )
 
-    valid_target = []
-    valid_reference = []
-    valid_context = []
+    # --------------------------------------------------------
+    # OBJECTIVE ATTRIBUTE VALIDATION
+    # --------------------------------------------------------
 
-    for item in interpretation.get(
-        "target_columns",
-        [],
-    ):
-        column = item.get("column")
+    objective_attributes, missing_attributes, selection_valid = (
+        _validate_attribute_selection(
+            interpretation=interpretation,
+            selected_columns=selected_columns,
+        )
+    )
 
-        if column in selected:
-            valid_target.append(item)
+    # --------------------------------------------------------
+    # COLUMNS RECOMMENDED FOR DETECTION
+    # --------------------------------------------------------
 
-    for item in interpretation.get(
-        "reference_columns",
-        [],
-    ):
-        column = item.get("column")
+    valid_detection = _validate_detection_columns(
+        interpretation,
+        selected,
+    )
 
-        if column in selected:
-            valid_reference.append(item)
+    valid_target = valid_detection
 
-    for item in interpretation.get(
-        "context_columns",
-        [],
-    ):
-        column = item.get("column")
+    # --------------------------------------------------------
+    # REFERENCE COLUMNS
+    # --------------------------------------------------------
 
-        if column in selected:
-            valid_context.append(item)
+    valid_reference = _validate_role(
+        interpretation=interpretation,
+        role="reference",
+        selected_columns=selected,
+    )
 
-    # A target should normally exist for point-style numerical
-    # detection. However, we do not reject the objective because
-    # collective/contextual objectives may be expressed without a
-    # directly named target.
-    if not valid_target:
+    # --------------------------------------------------------
+    # CONTEXT COLUMNS
+    # --------------------------------------------------------
+
+    valid_context = _validate_role(
+        interpretation=interpretation,
+        role="context",
+        selected_columns=selected,
+    )
+
+    # --------------------------------------------------------
+    # DETECTION WARNING
+    # --------------------------------------------------------
+
+    if not valid_detection:
+
         warnings.append(
-            "No sufficiently confident target column was identified "
-            "from the selected columns."
+            "No sufficiently confident column was identified "
+            "for the stated detection objective from the "
+            "selected columns."
         )
 
-    # Check temporal requirement against actual selected columns.
+    # --------------------------------------------------------
+    # TEMPORAL VALIDATION
+    # --------------------------------------------------------
+
     temporal_columns = [
         column
         for column in selected_columns
         if _is_temporal(
-            column_profiles.get(column, {})
+            column_profiles.get(
+                column,
+                {},
+            )
         )
     ]
 
-    temporal_requirement = interpretation.get(
-        "temporal_requirement",
-        "unclear",
-    )
+    temporal_requirement = str(
+        interpretation.get(
+            "temporal_requirement",
+            "unclear",
+        )
+    ).lower()
 
     if (
         temporal_requirement == "required"
         and not temporal_columns
     ):
+
         warnings.append(
-            "The objective requires temporal behavior, but no "
-            "selected temporal column was identified."
+            "The objective requires temporal analysis, "
+            "but no selected temporal column is available."
         )
 
     if (
         temporal_requirement == "required"
         and temporal_columns
     ):
+
         assumptions.append(
-            "Temporal behavior can be analyzed using the selected "
-            f"temporal column(s): {', '.join(temporal_columns)}."
+            "Temporal behavior can be analyzed using "
+            "the selected temporal column(s): "
+            + ", ".join(temporal_columns)
+            + "."
         )
 
-    # Local comparison should have some reference/context evidence.
+    # --------------------------------------------------------
+    # LOCAL COMPARISON VALIDATION
+    # --------------------------------------------------------
+
+    comparison_scope = str(
+        interpretation.get(
+            "comparison_scope",
+            "none",
+        )
+    ).lower()
+
     if (
-        interpretation.get("comparison_scope") == "local"
+        comparison_scope == "local"
         and not valid_reference
         and not valid_context
+        and not any(
+            item.get("role") == "entity_identifier"
+            for item in valid_detection
+        )
     ):
+
         warnings.append(
-            "The objective implies local comparison, but no "
-            "reference/context column was confidently identified."
+            "The objective implies local comparison, "
+            "but no meaningful grouping, reference or "
+            "context column was confidently identified."
         )
 
-    # Validate target suitability where possible.
-    for item in valid_target:
-        profile = column_profiles.get(
-            item["column"],
-            {},
+    # --------------------------------------------------------
+    # PHASE 3 AVAILABILITY
+    # --------------------------------------------------------
+
+    if not phase3_statistics:
+
+        assumptions.append(
+            "Phase 3 statistical evidence was not available "
+            "during objective validation."
         )
 
-        if not _is_numeric(profile):
-            assumptions.append(
-                f"Target column '{item['column']}' is not "
-                "classified as numeric. Model suitability will "
-                "account for this."
-            )
+    # --------------------------------------------------------
+    # MISSING ATTRIBUTE WARNING
+    # --------------------------------------------------------
 
-    # Validate collective behavior against available evidence.
-    if interpretation.get("anomaly_type") == "collective":
-        if not phase3_statistics:
-            warnings.append(
-                "Collective anomaly interpretation has limited "
-                "statistical evidence because Phase 3 statistics "
-                "are unavailable."
-            )
+    if missing_attributes:
 
-    interpretation = {
+        warnings.append(
+            "One or more attributes required by the "
+            "investigation objective were not included "
+            "in the confirmed Phase 2 selection."
+        )
+
+    # --------------------------------------------------------
+    # RETURN
+    # --------------------------------------------------------
+
+    return {
         **interpretation,
-        "target_columns": valid_target,
-        "reference_columns": valid_reference,
-        "context_columns": valid_context,
-        "assumptions": list(dict.fromkeys(assumptions)),
-        "warnings": list(dict.fromkeys(warnings)),
+
+        "attributes_involved":
+            objective_attributes,
+
+        "target_columns":
+            valid_target,
+
+        "reference_columns":
+            valid_reference,
+
+        "context_columns":
+            valid_context,
+
+        "attribute_selection_valid":
+            selection_valid,
+
+        "missing_attributes":
+            missing_attributes,
+
+        "assumptions":
+            list(
+                dict.fromkeys(
+                    assumptions
+                )
+            ),
+
+        "warnings":
+            list(
+                dict.fromkeys(
+                    warnings
+                )
+            ),
     }
 
-    return interpretation
 
+# ============================================================
+# PHASE 5 HELPER
+# ============================================================
 
 def objective_feature_summary(
     interpretation: dict[str, Any],
 ) -> dict[str, Any]:
 
-    target_count = len(
-        interpretation.get("target_columns", [])
+    detection_columns = interpretation.get(
+        "target_columns",
+        [],
     )
 
-    reference_count = len(
-        interpretation.get("reference_columns", [])
+    reference_columns = interpretation.get(
+        "reference_columns",
+        [],
     )
 
-    context_count = len(
-        interpretation.get("context_columns", [])
+    context_columns = interpretation.get(
+        "context_columns",
+        [],
     )
 
     return {
-        "anomaly_type": interpretation.get(
-            "anomaly_type",
-            "point",
-        ),
-        "comparison_scope": interpretation.get(
-            "comparison_scope",
-            "none",
-        ),
-        "detection_behavior": interpretation.get(
-            "detection_behavior",
-            "",
-        ),
-        "temporal_requirement": interpretation.get(
-            "temporal_requirement",
-            "unclear",
-        ),
-        "target_count": target_count,
-        "reference_count": reference_count,
-        "context_count": context_count,
+        "anomaly_type":
+            interpretation.get(
+                "anomaly_type",
+                "point",
+            ),
+
+        "comparison_scope":
+            interpretation.get(
+                "comparison_scope",
+                "none",
+            ),
+
+        "detection_behavior":
+            interpretation.get(
+                "detection_behavior",
+                "",
+            ),
+
+        "temporal_requirement":
+            interpretation.get(
+                "temporal_requirement",
+                "unclear",
+            ),
+
+        "detection_count":
+            len(detection_columns),
+
+        "target_count":
+            len(detection_columns),
+
+        "reference_count":
+            len(reference_columns),
+
+        "context_count":
+            len(context_columns),
+
+        "detection_columns": [
+            item["column"]
+            for item in detection_columns
+            if item.get("column")
+        ],
+
         "target_columns": [
             item["column"]
-            for item in interpretation.get(
-                "target_columns",
-                [],
-            )
+            for item in detection_columns
+            if item.get("column")
         ],
+
         "reference_columns": [
             item["column"]
-            for item in interpretation.get(
-                "reference_columns",
-                [],
-            )
+            for item in reference_columns
+            if item.get("column")
         ],
+
         "context_columns": [
             item["column"]
-            for item in interpretation.get(
-                "context_columns",
-                [],
-            )
+            for item in context_columns
+            if item.get("column")
         ],
+
+        "detection_column_roles": [
+            {
+                "column": item.get("column"),
+                "role": item.get("role"),
+                "confidence": item.get("confidence"),
+                "evidence": item.get("evidence"),
+            }
+            for item in detection_columns
+            if item.get("column")
+        ],
+
+        "attribute_selection_valid":
+            interpretation.get(
+                "attribute_selection_valid",
+                True,
+            ),
+
+        "missing_attributes":
+            interpretation.get(
+                "missing_attributes",
+                [],
+            ),
     }

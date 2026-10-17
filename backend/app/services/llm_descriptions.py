@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 from dotenv import load_dotenv
 
 try:
@@ -20,12 +19,7 @@ except ImportError:
 # ENVIRONMENT
 # =========================================================
 
-# Load backend/.env reliably when this module is imported.
-
-
-_ENV_FILE = (
-    Path(__file__).resolve().parents[2] / ".env"
-)
+_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 load_dotenv(
     dotenv_path=_ENV_FILE,
@@ -37,32 +31,20 @@ load_dotenv(
 # LLM CONFIGURATION
 # =========================================================
 
-# The model is read from the environment at runtime.
-# This avoids using an outdated model value if .env changes.
 DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
-
 GROQ_API_KEY_ENV = "GROQ_API_KEY"
 
-# Maximum representative values sent for one column.
 MAX_SAMPLE_VALUES = 12
-
-# Maximum strongest numeric relationships.
 MAX_NUMERIC_RELATIONSHIPS = 30
-
-# Maximum common categorical values.
 MAX_COMMON_VALUES = 10
-
-# Maximum columns included in semantic context.
 MAX_COLUMNS_IN_CONTEXT = 150
 
 
 def _get_llm_model() -> str:
     """
     Get the currently configured Groq model.
-
-    The value is read at runtime so changes in .env
-    are respected without modifying this file.
     """
+
     return (
         os.getenv(
             "LLM_DESCRIPTION_MODEL",
@@ -81,6 +63,7 @@ def _safe_value(value: Any) -> Any:
     Convert pandas / numpy / datetime values into
     JSON-safe primitive values.
     """
+
     if value is None:
         return None
 
@@ -112,6 +95,7 @@ def _round_number(
     """
     Safely round numeric values.
     """
+
     try:
         if pd.isna(value):
             return None
@@ -120,6 +104,7 @@ def _round_number(
             float(value),
             digits,
         )
+
     except Exception:
         return _safe_value(value)
 
@@ -135,10 +120,9 @@ def _sample_values(
     """
     Return representative non-null values.
 
-    The complete raw column is intentionally NOT sent
-    to the LLM. A compact representative sample is used
-    for semantic reasoning while keeping the prompt small.
+    The complete raw column is never sent to the LLM.
     """
+
     try:
         non_null = series.dropna()
 
@@ -147,6 +131,7 @@ def _sample_values(
 
         if len(non_null) <= limit:
             selected = non_null
+
         else:
             head_count = min(
                 5,
@@ -184,11 +169,12 @@ def _value_pattern(
     series: pd.Series,
 ) -> dict[str, Any]:
     """
-    Build semantic evidence for one column.
+    Build evidence about the values.
 
-    This function provides evidence to the LLM.
-    It does NOT assign business meaning.
+    This function does NOT assign business meaning.
+    The LLM performs semantic interpretation.
     """
+
     result: dict[str, Any] = {}
 
     try:
@@ -223,6 +209,7 @@ def _value_pattern(
         )
 
         if numeric.notna().all():
+
             result["numeric"] = True
 
             result["minimum"] = _round_number(
@@ -268,17 +255,24 @@ def _value_pattern(
         # Datetime evidence
         # -------------------------------------------------
 
-        datetime_values = pd.to_datetime(
-            non_null,
-            errors="coerce",
-            format="mixed",
-        )
+        try:
+            datetime_values = pd.to_datetime(
+                non_null,
+                errors="coerce",
+                format="mixed",
+            )
+        except Exception:
+            datetime_values = pd.to_datetime(
+                non_null,
+                errors="coerce",
+            )
 
         valid_datetime_ratio = (
             datetime_values.notna().mean()
         )
 
         if valid_datetime_ratio >= 0.8:
+
             result["datetime_like"] = True
 
             result["datetime_valid_ratio"] = _round_number(
@@ -286,13 +280,17 @@ def _value_pattern(
                 4,
             )
 
-            result["earliest"] = _safe_value(
-                datetime_values.min()
-            )
+            valid_dates = datetime_values.dropna()
 
-            result["latest"] = _safe_value(
-                datetime_values.max()
-            )
+            if not valid_dates.empty:
+
+                result["earliest"] = _safe_value(
+                    valid_dates.min()
+                )
+
+                result["latest"] = _safe_value(
+                    valid_dates.max()
+                )
 
             return result
 
@@ -353,13 +351,12 @@ def _name_tokens(
     """
     Break a column name into semantic tokens.
 
-    This does NOT assign meaning.
-
     Examples:
         employee_name -> employee, name
-        joiningYear   -> joining, year
+        joiningYear -> joining, year
         monthly-salary -> monthly, salary
     """
+
     text = str(name)
 
     text = re.sub(
@@ -380,13 +377,11 @@ def _name_tokens(
         text,
     )
 
-    tokens = [
+    return [
         token.lower()
         for token in text.split()
         if token.strip()
     ]
-
-    return tokens
 
 
 # =========================================================
@@ -399,195 +394,94 @@ def build_dataset_semantic_context(
     dataset_summary: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Build a compact semantic representation of the dataset.
+    Build the semantic context once per dataset.
 
-    The raw dataset itself is NOT sent to Groq.
+    IMPORTANT PERFORMANCE CHANGE:
+    The previous implementation rebuilt value patterns, missing counts and
+    full numeric correlations from the entire dataframe for every target
+    column. With 10M rows that turns Phase 1 into a repeated full-dataset
+    scan. The optimized version reuses the already-computed Phase 1 profiles.
 
-    The LLM receives evidence about:
-
-        - every column
-        - column names
-        - semantic name tokens
-        - data types
-        - roles
-        - missingness
-        - representative values
-        - numeric ranges
-        - categorical values
-        - temporal information
-        - cross-column numeric relationships
-        - dataset dimensions
+    The returned structure remains compatible with the LLM prompt.
     """
-
     summary_details = (
-        dataset_summary.get(
-            "column_details",
-            {},
-        )
-        if isinstance(
-            dataset_summary,
-            dict,
-        )
+        dataset_summary.get("column_details", {})
+        if isinstance(dataset_summary, dict)
         else {}
     )
 
-    all_columns = [
-        str(column)
-        for column in df.columns
-    ]
-
+    all_columns = [str(column) for column in df.columns]
     columns_context: list[dict[str, Any]] = []
 
-    # -----------------------------------------------------
-    # ALL COLUMN PROFILES
-    # -----------------------------------------------------
-
     for index, column in enumerate(df.columns):
-
         if index >= MAX_COLUMNS_IN_CONTEXT:
             break
 
         column_name = str(column)
+        detail = summary_details.get(column_name, {})
 
-        series = df[column]
-
-        detail = summary_details.get(
-            column_name,
-            {},
-        )
-
-        column_context = {
-            "name": column_name,
-
-            "name_tokens": _name_tokens(
-                column_name
-            ),
-
-            "dtype": str(
-                detail.get(
-                    "dtype",
-                    series.dtype,
-                )
-            ),
-
-            "role": detail.get(
-                "role",
-                "Feature",
-            ),
-
-            "row_count": int(
-                len(series)
-            ),
-
-            "missing_values": int(
-                series.isna().sum()
-            ),
-
-            "missing_percentage": _round_number(
-                series.isna().mean() * 100,
-                2,
-            ),
-
-            "sample_values": _sample_values(
-                series
-            ),
-
-            "value_pattern": _value_pattern(
-                series
+        pattern: dict[str, Any] = {
+            "observed_values": int(detail.get("non_null_values", 0) or 0),
+            "unique_values": int(detail.get("unique_values", 0) or 0),
+            "unique_ratio": _round_number(
+                detail.get("unique_ratio", 0.0), 4
             ),
         }
 
-        columns_context.append(
-            column_context
-        )
+        numeric_profile = detail.get("numeric_profile")
+        if isinstance(numeric_profile, dict) and numeric_profile:
+            pattern["numeric"] = True
+            pattern.update({
+                "minimum": numeric_profile.get("min"),
+                "maximum": numeric_profile.get("max"),
+                "mean": numeric_profile.get("mean"),
+                "median": numeric_profile.get("median"),
+                "std": numeric_profile.get("std"),
+            })
 
-    # -----------------------------------------------------
-    # NUMERIC RELATIONSHIPS
-    # -----------------------------------------------------
-
-    correlations: list[dict[str, Any]] = []
-
-    numeric_df = df.select_dtypes(
-        include="number"
-    )
-
-    if numeric_df.shape[1] >= 2:
-
-        try:
-            corr = numeric_df.corr(
-                numeric_only=True
-            )
-
-            for i, first in enumerate(
-                corr.columns
-            ):
-
-                for second in corr.columns[
-                    i + 1:
-                ]:
-
-                    value = corr.loc[
-                        first,
-                        second,
-                    ]
-
-                    if pd.notna(value):
-
-                        correlations.append(
-                            {
-                                "column_1": str(
-                                    first
-                                ),
-
-                                "column_2": str(
-                                    second
-                                ),
-
-                                "correlation": _round_number(
-                                    value,
-                                    4,
-                                ),
-                            }
-                        )
-
-            correlations = sorted(
-                correlations,
-                key=lambda item: abs(
-                    item["correlation"]
-                ),
-                reverse=True,
-            )[
-                :MAX_NUMERIC_RELATIONSHIPS
+        top_values = detail.get("top_values", [])
+        if top_values:
+            pattern["categorical_or_text"] = True
+            pattern["common_values"] = [
+                {
+                    "value": str(item.get("value")),
+                    "count": int(item.get("count", 0) or 0),
+                }
+                for item in top_values[:MAX_COMMON_VALUES]
             ]
 
-        except Exception:
-            correlations = []
+        if detail.get("kind") == "datetime":
+            pattern["datetime_like"] = True
+            samples = detail.get("sample_values", [])
+            if samples:
+                pattern["representative_datetime_values"] = samples[:6]
 
-    # -----------------------------------------------------
-    # BASIC DATASET CONTEXT
-    # -----------------------------------------------------
+        columns_context.append({
+            "name": column_name,
+            "name_tokens": _name_tokens(column_name),
+            "dtype": detail.get("dtype", "unknown"),
+            "role": detail.get("role", "Feature"),
+            "row_count": int(df.shape[0]),
+            "missing_values": int(detail.get("missing_values", 0) or 0),
+            "missing_percentage": _round_number(
+                detail.get("missing_percentage", 0.0), 2
+            ),
+            "sample_values": detail.get("sample_values", [])[:MAX_SAMPLE_VALUES],
+            "value_pattern": pattern,
+        })
 
-    dataset_context = {
-        "target_column": str(
-            target_column
-        ),
+    correlations = dataset_summary.get("numeric_relationships", [])
+    if not isinstance(correlations, list):
+        correlations = []
 
-        "row_count": int(
-            len(df)
-        ),
-
-        "column_count": int(
-            len(df.columns)
-        ),
-
+    return {
+        "target_column": str(target_column),
+        "row_count": int(df.shape[0]),
+        "column_count": int(df.shape[1]),
         "all_columns": all_columns,
-
         "columns": columns_context,
-
-        "numeric_relationships": correlations,
+        "numeric_relationships": correlations[:MAX_NUMERIC_RELATIONSHIPS],
     }
-
-    return dataset_context
 
 
 # =========================================================
@@ -596,14 +490,15 @@ def build_dataset_semantic_context(
 
 def _get_groq_client() -> Any:
     """
-    Create the Groq client from backend/.env.
+    Create the Groq client using backend/.env.
     """
 
     if Groq is None:
+
         print(
-            "GROQ CLIENT ERROR: groq package is not available "
-            "in the running Python environment."
+            "GROQ CLIENT ERROR: groq package is not installed."
         )
+
         return None
 
     api_key = os.getenv(
@@ -611,12 +506,20 @@ def _get_groq_client() -> Any:
     )
 
     if not api_key:
+
         print(
             "GROQ CLIENT ERROR: GROQ_API_KEY was not loaded."
         )
+
+        print(
+            "Expected .env location:",
+            str(_ENV_FILE),
+        )
+
         return None
 
     try:
+
         client = Groq(
             api_key=api_key
         )
@@ -628,10 +531,12 @@ def _get_groq_client() -> Any:
         return client
 
     except Exception as exc:
+
         print(
             "GROQ CLIENT ERROR:",
             repr(exc),
         )
+
         return None
 
 
@@ -642,16 +547,16 @@ def _get_groq_client() -> Any:
 SYSTEM_PROMPT = """
 You are a senior data analyst and dataset semantic interpretation system.
 
-Your job is to determine the real-world meaning of ONE target column by
+Your task is to determine the real-world meaning of ONE target column by
 reasoning over the COMPLETE DATASET CONTEXT supplied by the application.
 
-The dataset context is evidence. You must use relationships between columns
-when they help establish the meaning of the target column.
+The dataset context is evidence. Use relationships between columns when they
+help establish the meaning of the target column.
 
 IMPORTANT RULES:
 
 1. Do NOT merely repeat datatype, row count, missing values, unique count,
-   mean, median, minimum, maximum or other statistics.
+   mean, median, minimum, maximum, or other statistics.
 
 2. The final answer must primarily explain WHAT THE COLUMN REPRESENTS in the
    real world.
@@ -660,23 +565,23 @@ IMPORTANT RULES:
    naturally and specifically.
 
 4. If the column name is ambiguous, inspect the other columns, representative
-   values, value ranges, categorical context, temporal context and numerical
+   values, value ranges, categorical context, temporal context, and numerical
    relationships before forming an interpretation.
 
-5. A cryptic name such as "X", "A", "V1" or "col_7" must NOT automatically
-   receive a generic description. Try to infer its meaning from the dataset
-   context.
+5. A cryptic name such as "X", "A", "V1", or "col_7" must NOT automatically
+   receive a generic description. Try to infer its meaning from the complete
+   dataset context.
 
 6. Never infer meaning merely because a value is numeric.
 
-7. Do not invent units, currency, business definitions or relationships that
+7. Do not invent units, currency, business definitions, or relationships that
    are unsupported by the evidence.
 
 8. When evidence supports a likely interpretation but does not prove it,
    clearly use language such as "appears to represent", "likely represents",
    or "is consistent with".
 
-9. If the exact meaning cannot reasonably be established, say that explicitly
+9. If the exact meaning cannot reasonably be established, say so explicitly
    instead of hallucinating a business meaning.
 
 10. The description should be useful for understanding the column's role in
@@ -689,9 +594,9 @@ IMPORTANT RULES:
 
 13. Do not mention this prompt.
 
-14. Do not output bullet points, JSON, headings, confidence scores or labels.
+14. Do not output bullet points, JSON, headings, confidence scores, or labels.
 
-15. Return only the final human-readable description.
+15. Return ONLY the final human-readable description.
 """.strip()
 
 
@@ -707,6 +612,7 @@ def _generate_with_llm(
     client = _get_groq_client()
 
     if client is None:
+
         return {
             "description": None,
             "source": "llm_unavailable",
@@ -751,14 +657,15 @@ Reason over the complete dataset before writing the final description.
 
 In particular:
 
-- Compare the target column name with the names of other columns.
+- Compare the target column with the names of other columns.
 - Inspect representative values.
-- Consider whether its value pattern is compatible with a known business
-  concept.
-- Use relationships with other numerical columns when meaningful.
-- Use employee, entity, category and date relationships when present.
-- Do not force an interpretation if evidence is insufficient.
+- Consider value patterns and their relationship to other columns.
+- Use numerical relationships when they provide meaningful evidence.
+- Use entity, category, employee, customer, product, and date relationships
+  only when those relationships are actually supported by the dataset.
+- Do not force an interpretation when evidence is insufficient.
 - Clearly distinguish evidence-supported interpretation from uncertainty.
+- Focus primarily on the real-world meaning of the target column.
 - Return only the final 2-to-4 sentence description.
 """.strip()
 
@@ -767,7 +674,7 @@ In particular:
         response = client.chat.completions.create(
             model=model,
             temperature=0.1,
-            max_tokens=300,
+            max_tokens=1000,
             timeout=90.0,
             messages=[
                 {
@@ -781,27 +688,68 @@ In particular:
             ],
         )
 
+        if not response.choices:
+            raise ValueError(
+                "Groq returned no choices."
+            )
+
         choice = response.choices[0]
 
         message = choice.message
 
-        description = message.content
+        print(
+            "========== GROQ DEBUG =========="
+        )
 
-        # Some Groq reasoning models may return reasoning separately
-        # before producing the final answer. Use the final content only.
-        if description is None:
-            description = ""
+        print(
+            "MODEL:",
+            model,
+        )
 
-        description = description.strip()
+        print(
+            "FINISH REASON:",
+            getattr(
+                choice,
+                "finish_reason",
+                None,
+            ),
+        )
+
+        print(
+            "MESSAGE CONTENT:",
+            repr(
+                getattr(
+                    message,
+                    "content",
+                    None,
+                )
+            ),
+        )
+
+        print(
+            "MESSAGE REASONING:",
+            repr(
+                getattr(
+                    message,
+                    "reasoning",
+                    None,
+                )
+            ),
+        )
+
+        print(
+            "================================"
+        )
+
+        description = getattr(
+            message,
+            "content",
+            None,
+        )
 
         if not description:
             raise ValueError(
                 "LLM returned an empty description."
-            )
-
-        if description is None:
-            raise ValueError(
-                "LLM returned no content."
             )
 
         description = description.strip()
@@ -819,9 +767,8 @@ In particular:
 
     except Exception as exc:
 
-        # Keep API details server-side.
         print(
-            "LLM column-description error:",
+            "LLM COLUMN-DESCRIPTION ERROR:",
             repr(exc),
         )
 
@@ -897,16 +844,17 @@ def generate_column_description(
     dataset_summary: dict[str, Any],
     *,
     df: pd.DataFrame | None = None,
+    semantic_context: dict[str, Any] | None = None,
     use_llm: bool = True,
 ) -> dict[str, Any]:
     """
     Generate a semantic description for one column.
 
-    Preferred flow:
+    Flow:
 
         complete dataframe
                 ↓
-        dataset semantic profile
+        dataset semantic context
                 ↓
         target column + complete context
                 ↓
@@ -918,67 +866,105 @@ def generate_column_description(
     is returned.
     """
 
+    # -----------------------------------------------------
+    # LLM DISABLED
+    # -----------------------------------------------------
+
     if not use_llm:
+
         return {
-            "description": _fallback_description(profile),
+            "description": _fallback_description(
+                profile
+            ),
             "source": "fallback",
             "model": None,
         }
 
+    # -----------------------------------------------------
+    # DATAFRAME REQUIRED
+    # -----------------------------------------------------
+
     if df is None:
+
         return {
-            "description": _fallback_description(profile),
+            "description": _fallback_description(
+                profile
+            ),
             "source": "fallback_no_dataframe",
             "model": None,
         }
 
+    # -----------------------------------------------------
+    # BUILD CONTEXT + CALL LLM
+    # -----------------------------------------------------
+
     try:
-        dataset_context = build_dataset_semantic_context(
-            df=df,
-            target_column=str(
-                profile.get(
-                    "name",
-                    "",
-                )
-            ),
-            dataset_summary=dataset_summary,
-        )
+
+        # Reuse the dataset-level semantic context when Phase 1 has already
+        # built it. This is the critical optimization for wide/huge datasets.
+        if semantic_context is not None:
+            dataset_context = dict(semantic_context)
+            dataset_context["target_column"] = str(
+                profile.get("name", "")
+            )
+        else:
+            dataset_context = build_dataset_semantic_context(
+                df=df,
+                target_column=str(profile.get("name", "")),
+                dataset_summary=dataset_summary,
+            )
 
         result = _generate_with_llm(
             profile=profile,
             dataset_context=dataset_context,
         )
 
-        # IMPORTANT:
-        # Preserve the actual LLM error instead of silently
-        # converting it to "fallback".
+        # -------------------------------------------------
+        # SUCCESS
+        # -------------------------------------------------
+
         if result.get("description"):
+
             return result
 
+        # -------------------------------------------------  
+        # LLM FAILED
+        # -------------------------------------------------
+
         return {
-            "description": _fallback_description(profile),
+            "description": _fallback_description(
+                profile
+            ),
+
             "source": result.get(
                 "source",
                 "llm_error",
             ),
+
             "model": result.get(
                 "model"
             ),
+
             "error": result.get(
                 "error"
             ),
         }
 
     except Exception as exc:
+
         print(
             "COLUMN DESCRIPTION PIPELINE ERROR:",
             repr(exc),
         )
 
         return {
-            "description": _fallback_description(profile),
+            "description": _fallback_description(
+                profile
+            ),
+
             "source": "llm_pipeline_error",
+
             "model": _get_llm_model(),
+
             "error": repr(exc),
         }
-

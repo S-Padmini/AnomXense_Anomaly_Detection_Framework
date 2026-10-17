@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 
 from app.core.store import store
-from app.phases.phase4.objective_matcher import (
-    validate_objective_match,
-)
-from app.phases.phase4.objective_parser import (
-    parse_objective,
-)
-from app.phases.phase4.recommendation import (
-    recommend_models,
-)
+from app.db.database import get_db
+from app.db.models import Objective
+from app.phases.phase4.objective_parser import parse_objective
+from app.phases.phase4.objective_matcher import validate_objective_match
 from app.schemas.phase4_schema import (
     ObjectiveRequest,
     Phase4AnalysisResponse,
@@ -25,269 +21,886 @@ router = APIRouter(
 )
 
 
-def _get_column_profiles(session) -> dict:
-    """
-    Extract Phase 1 column profiles without assuming one exact
-    schema shape.
-    """
+# ============================================================
+# SESSION HELPER
+# ============================================================
 
-    summary = session.summary or {}
+def _get_session(dataset_id: str):
+    try:
+        return store.get(dataset_id)
 
-    profiles = (
-        summary.get("column_profiles")
-        or summary.get("columns")
-        or {}
-    )
+    except KeyError as exc:
 
-    if isinstance(profiles, list):
-        result = {}
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset session not found.",
+        ) from exc
 
-        for item in profiles:
-            if not isinstance(item, dict):
-                continue
 
-            name = (
-                item.get("name")
-                or item.get("column")
-                or item.get("column_name")
-            )
+# ============================================================
+# COLUMN RESPONSE HELPERS
+# ============================================================
 
-            if name:
-                result[str(name)] = item
+def _column_to_response(column):
 
-        return result
+    if isinstance(column, dict):
 
-    if isinstance(profiles, dict):
+        name = (
+            column.get("column")
+            or column.get("name")
+            or column.get("column_name")
+        )
+
+        reason = (
+            column.get("reason")
+            or column.get("evidence")
+            or column.get("explanation")
+            or column.get("why_relevant")
+            or ""
+        )
+
+        confidence = column.get("confidence")
+
+        evidence = column.get("evidence")
+
+        role = column.get(
+            "role",
+            "detection_feature",
+        )
+
         return {
-            str(key): value
-            for key, value in profiles.items()
-            if isinstance(value, dict)
+            "column": name,
+            "role": role,
+            "reason": reason,
+            "confidence": confidence,
+            "evidence": evidence,
         }
 
+    return {
+        "column": str(column),
+        "role": "detection_feature",
+        "reason": "",
+        "confidence": None,
+        "evidence": None,
+    }
+
+
+def _normalize_columns(columns):
+
+    normalized = []
+
+    for column in columns or []:
+
+        if not column:
+            continue
+
+        item = _column_to_response(
+            column
+        )
+
+        if not item.get("column"):
+            continue
+
+        normalized.append(item)
+
+    return normalized
+
+
+def _column_names(columns):
+
+    return [
+        str(item.get("column"))
+        for item in columns or []
+        if item.get("column")
+    ]
+
+
+# ============================================================
+# COLUMN PROFILE RESOLUTION
+# ============================================================
+
+def _get_column_profiles(session):
+
+    profiles = (
+        getattr(
+            session,
+            "column_profiles",
+            None,
+        )
+        or getattr(
+            session,
+            "profiles",
+            None,
+        )
+    )
+
+    if isinstance(
+        profiles,
+        dict,
+    ) and profiles:
+
+        return profiles
+
+    summary = getattr(
+        session,
+        "summary",
+        {},
+    ) or {}
+
+    column_details = summary.get(
+        "column_details",
+        {},
+    )
+
+    if isinstance(
+        column_details,
+        dict,
+    ):
+
+        return column_details
+
     return {}
 
 
-def _get_phase3_statistics(session) -> dict:
-    result = session.statistical_result
+# ============================================================
+# OBJECTIVE UNDERSTANDING
+# ============================================================
 
-    if isinstance(result, dict):
-        return result
+def _build_objective_understanding(
+    *,
+    original_objective,
+    validated_objective,
+    interpreted_objective,
+    anomaly_type,
+    anomaly_type_confidence,
+    anomaly_type_reason,
+    target_columns,
+    reference_columns,
+    context_columns,
+):
 
-    return {}
+    return {
+        "original_objective":
+            original_objective,
+
+        "interpreted_objective":
+            interpreted_objective,
+
+        "anomaly_type":
+            anomaly_type,
+
+        "anomaly_type_confidence":
+            anomaly_type_confidence,
+
+        "anomaly_type_reason":
+            anomaly_type_reason,
+
+        "comparison_scope":
+            (
+                validated_objective.get(
+                    "comparison_scope"
+                )
+                or "none"
+            ),
+
+        "comparison_scope_confidence":
+            validated_objective.get(
+                "comparison_scope_confidence"
+            ),
+
+        "comparison_scope_reason":
+            (
+                validated_objective.get(
+                    "comparison_scope_reason"
+                )
+                or ""
+            ),
+
+        "detection_behavior":
+            (
+                validated_objective.get(
+                    "detection_behavior"
+                )
+                or ""
+            ),
+
+        "detection_behavior_reason":
+            (
+                validated_objective.get(
+                    "detection_behavior_reason"
+                )
+                or ""
+            ),
+
+        "temporal_requirement":
+            (
+                validated_objective.get(
+                    "temporal_requirement"
+                )
+                or "unclear"
+            ),
+
+        "temporal_requirement_reason":
+            (
+                validated_objective.get(
+                    "temporal_requirement_reason"
+                )
+                or ""
+            ),
+
+        # Existing semantic fields.
+        "target_columns":
+            target_columns,
+
+        "reference_columns":
+            reference_columns,
+
+        "context_columns":
+            context_columns,
+
+        "attributes_involved":
+            _normalize_columns(
+                validated_objective.get(
+                    "attributes_involved",
+                    [],
+                )
+            ),
+
+        # ----------------------------------------------------
+        # EXISTING DYNAMIC VALIDATION
+        # ----------------------------------------------------
+
+        "attribute_selection_valid":
+            bool(
+                validated_objective.get(
+                    "attribute_selection_valid",
+                    True,
+                )
+            ),
+
+        "missing_attributes":
+            list(
+                validated_objective.get(
+                    "missing_attributes",
+                    [],
+                )
+                or []
+            ),
+
+        "assumptions":
+            (
+                validated_objective.get(
+                    "assumptions",
+                    [],
+                )
+                or []
+            ),
+
+        "warnings":
+            (
+                validated_objective.get(
+                    "warnings",
+                    [],
+                )
+                or []
+            ),
+    }
 
 
-def _selected_columns(session) -> list[str]:
+# ============================================================
+# DATABASE PERSISTENCE HELPERS
+# ============================================================
 
-    columns = list(
-        session.selected_columns or []
+def _save_objective(
+    db: Session,
+    *,
+    dataset_id: str,
+    objective: dict,
+    confirmed: bool,
+) -> Objective:
+    """
+    Persist the current Phase 4 objective interpretation
+    into OBJECTIVES.
+
+    Analyze creates/updates the objective with confirmed=False.
+    Confirm updates the same latest objective to confirmed=True.
+    """
+
+    anomaly_scope = (
+        objective.get("anomaly_scope")
+        or objective.get("comparison_scope")
+        or "none"
     )
 
-    if not columns:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No columns are selected. Complete Phase 2 "
-                "column selection first."
+    target_columns = _column_names(
+        objective.get("target_columns", [])
+    )
+
+    attributes_involved = _column_names(
+        objective.get("attributes_involved", [])
+    )
+
+    existing = (
+        db.query(Objective)
+        .filter(
+            Objective.dataset_id == dataset_id
+        )
+        .order_by(
+            Objective.objective_id.desc()
+        )
+        .first()
+    )
+
+    if existing is None:
+
+        existing = Objective(
+            dataset_id=dataset_id,
+            original_objective=str(
+                objective.get(
+                    "original_objective",
+                    "",
+                )
             ),
+            interpreted_objective=str(
+                objective.get(
+                    "interpreted_objective",
+                    "",
+                )
+            ),
+            anomaly_type=str(
+                objective.get(
+                    "anomaly_type",
+                    "point",
+                )
+            ),
+            anomaly_scope=str(
+                anomaly_scope
+            ),
+            target_columns=target_columns,
+            attributes_involved=attributes_involved,
+            confirmed=confirmed,
         )
 
-    if not session.confirmed:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Phase 2 column selection has not been confirmed."
-            ),
+        db.add(existing)
+
+    else:
+
+        existing.original_objective = str(
+            objective.get(
+                "original_objective",
+                existing.original_objective,
+            )
         )
 
-    return columns
+        existing.interpreted_objective = str(
+            objective.get(
+                "interpreted_objective",
+                existing.interpreted_objective,
+            )
+        )
+
+        existing.anomaly_type = str(
+            objective.get(
+                "anomaly_type",
+                existing.anomaly_type,
+            )
+        )
+
+        existing.anomaly_scope = str(
+            anomaly_scope
+        )
+
+        existing.target_columns = (
+            target_columns
+        )
+
+        existing.attributes_involved = (
+            attributes_involved
+        )
+
+        existing.confirmed = confirmed
+
+    db.commit()
+    db.refresh(existing)
+
+    return existing
 
 
-def _run_phase4(
-    session,
-    objective: str,
-) -> tuple[dict, list[dict]]:
-
-    selected_columns = _selected_columns(
-        session
-    )
-
-    column_profiles = _get_column_profiles(
-        session
-    )
-
-    statistics = _get_phase3_statistics(
-        session
-    )
-
-    interpretation = parse_objective(
-        objective=objective,
-        selected_columns=selected_columns,
-        column_profiles=column_profiles,
-        phase3_statistics=statistics,
-    )
-
-    interpretation = validate_objective_match(
-        interpretation=interpretation,
-        selected_columns=selected_columns,
-        column_profiles=column_profiles,
-        phase3_statistics=statistics,
-    )
-
-    recommendations = recommend_models(
-        statistical_profile=statistics,
-        interpretation=interpretation,
-        column_profiles=column_profiles,
-        top_n=3,
-    )
-
-    return interpretation, recommendations
-
+# ============================================================
+# PHASE 4 ANALYZE
+# ============================================================
 
 @router.post(
     "/{dataset_id}/analyze",
     response_model=Phase4AnalysisResponse,
 )
-def analyze_objective(
+async def analyze_phase4_objective(
     dataset_id: str,
-    payload: ObjectiveRequest,
+    request: ObjectiveRequest,
+    db: Session = Depends(get_db),
 ):
 
-    try:
-        session = store.get(dataset_id)
-    except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail="Dataset session not found or expired.",
-        )
+    session = _get_session(
+        dataset_id
+    )
 
-    objective = payload.objective.strip()
+    if not getattr(
+        session,
+        "confirmed",
+        False,
+    ):
 
-    if len(objective) < 5:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Please provide a meaningful detection objective."
+                "Please complete and confirm the "
+                "previous phases before continuing "
+                "to Phase 4."
             ),
         )
 
-    try:
-        interpretation, recommendations = _run_phase4(
-            session,
-            objective,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
+    selected_columns = getattr(
+        session,
+        "selected_columns",
+        None,
+    )
+
+    if not selected_columns:
+
         raise HTTPException(
-            status_code=500,
-            detail=f"Phase 4 analysis failed: {str(exc)}",
+            status_code=400,
+            detail=(
+                "No columns have been selected. "
+                "Please complete Phase 2 first."
+            ),
+        )
+
+    objective = (
+        request.objective.strip()
+        if request.objective
+        else ""
+    )
+
+    if not objective:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Please enter your detection objective."
+            ),
+        )
+
+    if len(objective) < 5:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Please provide a little more detail "
+                "about what you want to detect."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # PHASE 1 PROFILES
+    # --------------------------------------------------------
+
+    column_profiles = _get_column_profiles(
+        session
+    )
+
+    # --------------------------------------------------------
+    # PHASE 3 STATISTICS
+    # --------------------------------------------------------
+
+    phase3_statistics = (
+        getattr(
+            session,
+            "statistical_analysis",
+            None,
+        )
+        or getattr(
+            session,
+            "statistics",
+            None,
+        )
+        or {}
+    )
+
+    # --------------------------------------------------------
+    # COMPLETE DATASET COLUMN LIST
+    # --------------------------------------------------------
+
+    dataset_columns = [
+        str(column)
+        for column in session.dataframe.columns
+    ]
+
+    # --------------------------------------------------------
+    # OBJECTIVE PARSING
+    # --------------------------------------------------------
+
+    try:
+
+        parsed_objective = parse_objective(
+            objective=objective,
+            selected_columns=selected_columns,
+            available_columns=dataset_columns,
+            column_profiles=column_profiles,
+            phase3_statistics=phase3_statistics,
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Unable to understand the objective "
+                f"using the language model: {str(exc)}"
+            ),
         ) from exc
 
-    # Store the result directly in the existing session.
-    session.phase4_objective = interpretation
-    session.phase4_recommendations = recommendations
+    if not parsed_objective:
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The language model returned an "
+                "empty objective interpretation."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # DETERMINISTIC VALIDATION
+    # --------------------------------------------------------
+
+    try:
+
+        validated_objective = validate_objective_match(
+            interpretation=parsed_objective,
+            selected_columns=selected_columns,
+            column_profiles=column_profiles,
+            phase3_statistics=phase3_statistics,
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to validate the objective "
+                f"interpretation: {str(exc)}"
+            ),
+        ) from exc
+
+    if not validated_objective:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Objective validation returned "
+                "an empty result."
+            ),
+        )
+
+    interpreted_objective = (
+        validated_objective.get(
+            "interpreted_objective"
+        )
+        or objective
+    )
+
+    anomaly_type = (
+        validated_objective.get(
+            "anomaly_type"
+        )
+        or "point"
+    )
+
+    anomaly_type_confidence = (
+        validated_objective.get(
+            "anomaly_type_confidence"
+        )
+    )
+
+    anomaly_type_reason = (
+        validated_objective.get(
+            "anomaly_type_reason"
+        )
+        or ""
+    )
+
+    normalized_detection_columns = (
+        _normalize_columns(
+            validated_objective.get(
+                "target_columns",
+                [],
+            )
+        )
+    )
+
+    normalized_reference_columns = (
+        _normalize_columns(
+            validated_objective.get(
+                "reference_columns",
+                [],
+            )
+        )
+    )
+
+    normalized_context_columns = (
+        _normalize_columns(
+            validated_objective.get(
+                "context_columns",
+                [],
+            )
+        )
+    )
+
+    objective_understanding = (
+        _build_objective_understanding(
+            original_objective=objective,
+            validated_objective=validated_objective,
+            interpreted_objective=interpreted_objective,
+            anomaly_type=anomaly_type,
+            anomaly_type_confidence=anomaly_type_confidence,
+            anomaly_type_reason=anomaly_type_reason,
+            target_columns=normalized_detection_columns,
+            reference_columns=normalized_reference_columns,
+            context_columns=normalized_context_columns,
+        )
+    )
+
+    # --------------------------------------------------------
+    # STORE CURRENT PHASE 4 STATE
+    # --------------------------------------------------------
+
+    session.phase4_objective = (
+        objective_understanding
+    )
+
+    session.phase4_recommendations = []
+
+    session.phase4_analyzed = True
+
+    # Every new objective analysis must be confirmed again.
     session.phase4_confirmed = False
-    session.touch()
+
+    # --------------------------------------------------------
+    # SAVE OBJECTIVE TO DATABASE
+    # --------------------------------------------------------
+
+    try:
+
+        _save_objective(
+            db=db,
+            dataset_id=dataset_id,
+            objective=objective_understanding,
+            confirmed=False,
+        )
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Objective analysis completed, but "
+                "the result could not be saved to the "
+                f"database: {exc}"
+            ),
+        ) from exc
 
     return {
         "dataset_id": dataset_id,
-        "objective": interpretation,
-        "recommendations": recommendations,
+
+        "objective":
+            objective_understanding,
+
+        "recommendations": [],
+
         "confirmed": False,
     }
 
+
+# ============================================================
+# PHASE 4 CONFIRM
+# ============================================================
 
 @router.post(
     "/{dataset_id}/confirm",
     response_model=Phase4ConfirmResponse,
 )
-def confirm_phase4(
+async def confirm_phase4_objective(
     dataset_id: str,
+    db: Session = Depends(get_db),
 ):
 
-    try:
-        session = store.get(dataset_id)
-    except KeyError:
+    session = _get_session(
+        dataset_id
+    )
+
+    if not getattr(
+        session,
+        "phase4_analyzed",
+        False,
+    ):
+
         raise HTTPException(
-            status_code=404,
-            detail="Dataset session not found or expired.",
+            status_code=400,
+            detail=(
+                "Please analyze your objective "
+                "before confirming Phase 4."
+            ),
         )
 
-    objective = getattr(
+    phase4_objective = getattr(
         session,
         "phase4_objective",
         None,
     )
 
-    recommendations = getattr(
-        session,
-        "phase4_recommendations",
-        None,
-    )
+    if not phase4_objective:
 
-    if not objective or not recommendations:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Phase 4 has not been analyzed yet. "
-                "Analyze the detection objective first."
+                "No Phase 4 objective interpretation "
+                "is available."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # HARD BACKEND GATE
+    # --------------------------------------------------------
+
+    if not phase4_objective.get(
+        "attribute_selection_valid",
+        True,
+    ):
+
+        missing = phase4_objective.get(
+            "missing_attributes",
+            [],
+        )
+
+        missing_text = (
+            ", ".join(
+                str(column)
+                for column in missing
+            )
+            if missing
+            else "one or more required attributes"
+        )
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Phase 4 cannot be confirmed because "
+                "the following objective-required "
+                "attribute(s) are missing from the "
+                "confirmed Phase 2 selection: "
+                f"{missing_text}. "
+                "Please return to Phase 2, select the "
+                "required attribute(s), confirm the "
+                "selection, complete Phase 3 preprocessing "
+                "and statistical analysis, then return "
+                "to Phase 4."
             ),
         )
 
     session.phase4_confirmed = True
-    session.touch()
+
+    # --------------------------------------------------------
+    # UPDATE OBJECTIVE CONFIRMATION IN DATABASE
+    # --------------------------------------------------------
+
+    try:
+
+        _save_objective(
+            db=db,
+            dataset_id=dataset_id,
+            objective=phase4_objective,
+            confirmed=True,
+        )
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Phase 4 was confirmed, but the "
+                "confirmation could not be saved to the "
+                f"database: {exc}"
+            ),
+        ) from exc
 
     return {
-        "dataset_id": dataset_id,
-        "confirmed": True,
-        "objective": objective,
-        "recommendations": recommendations,
+        "dataset_id":
+            dataset_id,
+
+        "confirmed":
+            True,
+
+        "objective":
+            phase4_objective,
+
+        "recommendations": [],
     }
 
 
+# ============================================================
+# GET PHASE 4 OBJECTIVE
+# ============================================================
+
 @router.get(
-    "/{dataset_id}",
-    response_model=Phase4AnalysisResponse,
+    "/{dataset_id}"
 )
-def get_phase4_result(
+async def get_phase4_objective(
     dataset_id: str,
 ):
 
-    try:
-        session = store.get(dataset_id)
-    except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail="Dataset session not found or expired.",
-        )
+    session = _get_session(
+        dataset_id
+    )
 
-    objective = getattr(
+    phase4_objective = getattr(
         session,
         "phase4_objective",
         None,
     )
 
-    recommendations = getattr(
-        session,
-        "phase4_recommendations",
-        None,
-    )
+    if not phase4_objective:
 
-    if not objective or not recommendations:
         raise HTTPException(
             status_code=404,
-            detail="No Phase 4 result exists for this dataset.",
+            detail=(
+                "Phase 4 objective has not "
+                "been analyzed yet."
+            ),
         )
 
     return {
-        "dataset_id": dataset_id,
-        "objective": objective,
-        "recommendations": recommendations,
-        "confirmed": getattr(
-            session,
-            "phase4_confirmed",
-            False,
-        ),
-    }
+        "dataset_id":
+            dataset_id,
 
-    
+        "objective":
+            phase4_objective,
+
+        "recommendations":
+            getattr(
+                session,
+                "phase4_recommendations",
+                [],
+            )
+            or [],
+
+        "confirmed":
+            getattr(
+                session,
+                "phase4_confirmed",
+                False,
+            ),
+    }

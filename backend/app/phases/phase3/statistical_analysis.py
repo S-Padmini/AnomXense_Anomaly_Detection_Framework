@@ -10,6 +10,11 @@ from sklearn.metrics import silhouette_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
+# Exact descriptive statistics remain full-data; only expensive exploratory
+# clustering and nearest-neighbour analyses use a deterministic bounded sample.
+EXPENSIVE_ANALYSIS_SAMPLE_SIZE = 1000
+SILHOUETTE_SAMPLE_SIZE = 750
+
 
 # ============================================================
 # Utility Functions
@@ -103,6 +108,20 @@ def _cluster_label(silhouette: float) -> str:
 
 
 # ============================================================
+# Large-data helper
+# ============================================================
+
+def _bounded_analysis_sample(X: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Return all rows for small inputs or a deterministic sample for costly analyses."""
+    values = np.asarray(X)
+    if len(values) <= EXPENSIVE_ANALYSIS_SAMPLE_SIZE:
+        return values, False
+    rng = np.random.default_rng(42)
+    positions = np.sort(rng.choice(len(values), size=EXPENSIVE_ANALYSIS_SAMPLE_SIZE, replace=False))
+    return values[positions], True
+
+
+# ============================================================
 # 7. Cluster Structure Analysis
 # ============================================================
 
@@ -116,6 +135,8 @@ def _cluster_analysis(X: np.ndarray) -> dict[str, Any]:
     The best k is the one with the highest silhouette score.
     """
 
+    total_n = len(X)
+    X, sampled = _bounded_analysis_sample(X)
     n = len(X)
 
     if n < 4:
@@ -125,6 +146,9 @@ def _cluster_analysis(X: np.ndarray) -> dict[str, Any]:
             "cluster_structure": "Unavailable",
             "cluster_scores": [],
             "reason": "At least 4 records are required.",
+            "sampled": sampled,
+            "total_observations": int(total_n),
+            "observations_analyzed": int(n),
         }
 
     cluster_scores: list[dict[str, Any]] = []
@@ -148,7 +172,14 @@ def _cluster_analysis(X: np.ndarray) -> dict[str, Any]:
             if len(set(labels)) < 2:
                 continue
 
-            score = float(silhouette_score(X, labels))
+            score = float(
+                silhouette_score(
+                    X,
+                    labels,
+                    sample_size=min(SILHOUETTE_SAMPLE_SIZE, len(X)),
+                    random_state=42,
+                )
+            )
 
             cluster_scores.append(
                 {
@@ -171,6 +202,9 @@ def _cluster_analysis(X: np.ndarray) -> dict[str, Any]:
             "cluster_structure": "Unavailable",
             "cluster_scores": cluster_scores,
             "reason": "Cluster structure could not be estimated.",
+            "sampled": sampled,
+            "total_observations": int(total_n),
+            "observations_analyzed": int(n),
         }
 
     label = _cluster_label(best_score)
@@ -181,6 +215,9 @@ def _cluster_analysis(X: np.ndarray) -> dict[str, Any]:
         "cluster_structure": label,
         "cluster_scores": cluster_scores,
         "reason": None,
+        "sampled": sampled,
+        "total_observations": int(total_n),
+        "observations_analyzed": int(n),
     }
 
 
@@ -199,6 +236,8 @@ def _density_analysis(X: np.ndarray) -> dict[str, Any]:
     No additional density algorithms are performed.
     """
 
+    total_n = len(X)
+    X, sampled = _bounded_analysis_sample(X)
     n = len(X)
 
     if n < 3:
@@ -207,6 +246,8 @@ def _density_analysis(X: np.ndarray) -> dict[str, Any]:
             "mean_nearest_neighbor_distance": None,
             "density_variability_cv": None,
             "local_density": "Unavailable",
+            "sampled": sampled,
+            "total_observations": int(total_n),
         }
 
     # n_neighbors=2 because the first returned distance is
@@ -239,6 +280,8 @@ def _density_analysis(X: np.ndarray) -> dict[str, Any]:
 
     return {
         "observations_analyzed": int(n),
+        "total_observations": int(total_n),
+        "sampled": sampled,
         "mean_nearest_neighbor_distance": _finite_float(
             mean_distance
         ),
@@ -436,20 +479,18 @@ def _time_series_pattern_analysis(
 
     temporal_column = datetime_columns[0]
 
-    working = df.copy()
+    # Copy only the date and numeric signals required for this calculation.
+    # Avoid duplicating all categorical columns for large datasets.
+    working = pd.DataFrame({
+        "_analysis_datetime": pd.to_datetime(
+            df[temporal_column], errors="coerce", format="mixed"
+        )
+    })
+    for column in numeric_columns:
+        working[column] = pd.to_numeric(df[column], errors="coerce")
 
-    working["_analysis_datetime"] = pd.to_datetime(
-        working[temporal_column],
-        errors="coerce",
-        format="mixed",
-    )
-
-    working = working.dropna(
-        subset=["_analysis_datetime"]
-    )
-
-    working = working.sort_values(
-        "_analysis_datetime"
+    working = working.dropna(subset=["_analysis_datetime"]).sort_values(
+        "_analysis_datetime", kind="mergesort"
     )
 
     pattern_rows: list[dict[str, Any]] = []

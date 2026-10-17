@@ -1,10 +1,37 @@
+# ANOMALY / AnomXense - Backend Dependencies
+
+# API and server
 fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
 python-multipart>=0.0.20,<1
+
+# Data processing and statistical analysis
 pandas>=2.2,<3
 numpy>=2.0,<3
+scipy>=1.13,<2
 scikit-learn>=1.5,<2
+
+# Anomaly detection and explainability
+pyod>=2,<4
+shap>=0.46,<1
+
+# LLM integration
+groq>=1,<2
+
+# Database and migrations
+SQLAlchemy>=2,<3
+alembic>=1.13,<2
+psycopg[binary]>=3.2,<4
+
+# Visualization and report generation
+matplotlib>=3.8,<4
+plotly>=5,<8
 openpyxl>=3.1,<4
+reportlab>=4,<6
+
+# Environment configuration
+python-dotenv>=1,<2
+
+# Testing
 pytest>=8,<9
 httpx>=0.27,<1
-python-dotenv>=1.0,<2

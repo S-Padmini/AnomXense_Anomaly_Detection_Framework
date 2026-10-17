@@ -5,6 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    strictPort: false
+    strictPort: false,
+    allowedHosts: [
+      "huge-cargo-michel-variation.trycloudflare.com"
+    ]
   }
 });

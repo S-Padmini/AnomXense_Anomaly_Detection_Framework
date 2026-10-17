@@ -1,12 +1,55 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import pandas as pd
 
 from .dataset_summary import build_summary
 from .column_classifier import classify_dataframe
-from app.services.llm_descriptions import generate_column_description
+from app.services.llm_descriptions import (
+    build_dataset_semantic_context,
+    generate_column_description,
+)
+
+
+def _max_llm_workers(column_count: int) -> int:
+    """Bound concurrency so large schemas do not flood the LLM provider."""
+    configured = os.getenv("PHASE1_LLM_WORKERS", "4")
+    try:
+        workers = max(1, int(configured))
+    except ValueError:
+        workers = 4
+    return min(workers, max(1, column_count))
+
+
+def _describe_one(
+    column_name: str,
+    profile: dict[str, Any],
+    summary: dict[str, Any],
+    semantic_context: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    try:
+        result = generate_column_description(
+            profile=profile,
+            dataset_summary=summary,
+            semantic_context=semantic_context,
+        )
+
+        profile["description"] = result.get("description", "") or ""
+        profile["description_source"] = result.get("source", "unknown")
+        profile["description_model"] = result.get("model")
+        if result.get("error"):
+            profile["description_error"] = str(result["error"])
+
+    except Exception as exc:
+        profile["description"] = _fallback_column_description(profile, summary)
+        profile["description_source"] = "fallback"
+        profile["description_model"] = None
+        profile["description_error"] = str(exc)
+
+    return column_name, profile
 
 
 def analyze_dataset(
@@ -17,83 +60,71 @@ def analyze_dataset(
     """
     Phase 1 dataset analysis.
 
-    Responsibilities:
-    1. Build complete dataset/profile summary.
-    2. Generate a semantic LLM description for every column.
-    3. Store the description together with the column profile.
-
-    The LLM receives:
-    - column name
-    - data type
-    - detected role
-    - representative values
-    - top values
-    - numerical characteristics when applicable
-    - overall dataset context
+    The important optimization is that semantic dataset context is built ONCE.
+    The old implementation rebuilt it for every column and recalculated full
+    dataframe correlations and value statistics repeatedly.
     """
-
     summary = build_summary(
         df=df,
         filename=filename,
         file_size=file_size,
     )
 
-    for column_name, profile in summary["column_details"].items():
+    column_details = summary["column_details"]
 
-        try:
-            result = generate_column_description(
-                profile=profile,
-                dataset_summary=summary,
+    # Build semantic evidence once. It is reused by every LLM request.
+    semantic_context = build_dataset_semantic_context(
+        df=df,
+        target_column="",
+        dataset_summary=summary,
+    )
+
+    workers = _max_llm_workers(len(column_details))
+
+    if workers == 1:
+        for column_name, profile in column_details.items():
+            _, updated = _describe_one(
+                column_name, profile, summary, semantic_context
             )
-
-            profile["description"] = result.get(
-                "description",
-                "",
-            )
-
-            profile["description_source"] = result.get(
-                "source",
-                "unknown",
-            )
-
-            profile["description_model"] = result.get(
-                "model",
-                None,
-            )
-
-        except Exception as exc:
-            # Phase 1 should still work if the LLM service
-            # temporarily fails.
-            profile["description"] = (
-                _fallback_column_description(
+            column_details[column_name] = updated
+    else:
+        # Preserve column order while allowing independent LLM calls to run
+        # concurrently. Each result is written back to its original profile.
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _describe_one,
+                    column_name,
                     profile,
                     summary,
-                )
-            )
+                    semantic_context,
+                ): column_name
+                for column_name, profile in column_details.items()
+            }
 
-            profile["description_source"] = "fallback"
-            profile["description_model"] = None
-            profile["description_error"] = str(exc)
+            for future in as_completed(futures):
+                column_name = futures[future]
+                try:
+                    _, updated = future.result()
+                except Exception as exc:
+                    updated = dict(column_details[column_name])
+                    updated["description"] = _fallback_column_description(
+                        updated, summary
+                    )
+                    updated["description_source"] = "fallback"
+                    updated["description_model"] = None
+                    updated["description_error"] = str(exc)
 
-    # Keep both names for compatibility with the existing frontend.
+                column_details[column_name] = updated
+
     summary["column_profiles"] = summary["column_details"]
-
     return summary
 
 
-def get_column_profile(
-    df: pd.DataFrame,
-    column: str,
-) -> dict[str, Any]:
-    """
-    Return the classifier profile for a single column.
-    """
-
+def get_column_profile(df: pd.DataFrame, column: str) -> dict[str, Any]:
     if column not in df.columns:
         raise KeyError(column)
-
     profiles = classify_dataframe(df)
-
     return profiles[column]
 
 
@@ -101,13 +132,6 @@ def _fallback_column_description(
     profile: dict[str, Any],
     summary: dict[str, Any],
 ) -> str:
-    """
-    Non-LLM fallback.
-
-    This is intentionally semantic rather than simply returning
-    statistics such as 'Numeric column with 750 values'.
-    """
-
     name = profile.get("name", "This column")
     role = profile.get("role", "feature")
     kind = profile.get("kind", "unknown")
@@ -117,76 +141,63 @@ def _fallback_column_description(
     dataset_columns = summary.get("columns", 0)
 
     samples = ", ".join(
-        str(value)
-        for value in sample_values[:5]
-        if value is not None
+        str(value) for value in sample_values[:5] if value is not None
     )
 
     if kind == "identifier":
         description = (
             f"'{name}' appears to act as an identifier used to "
-            f"distinguish individual records or entities. "
-            f"It is generally useful for tracing or grouping "
-            f"observations, but should not normally be treated as "
-            f"a numerical measurement when building anomaly models."
+            f"distinguish individual records or entities. It is generally "
+            f"useful for tracing or grouping observations, but should not "
+            f"normally be treated as a numerical measurement when building "
+            f"anomaly models."
         )
-
     elif kind == "datetime":
         description = (
-            f"'{name}' is a date/time feature that represents when "
-            f"an observation or event occurred. It can provide "
-            f"temporal context for detecting changes, unusual timing, "
-            f"seasonality, or time-dependent anomalies."
+            f"'{name}' is a date/time feature that represents when an "
+            f"observation or event occurred. It can provide temporal context "
+            f"for detecting changes, unusual timing, seasonality, or "
+            f"time-dependent anomalies."
         )
-
     elif kind == "numeric":
         description = (
-            f"'{name}' is a numerical feature representing a "
-            f"measurable quantity. Numerical variation in this "
-            f"feature can be used to identify unusually large, small, "
-            f"or otherwise atypical observations."
+            f"'{name}' is a numerical feature representing a measurable "
+            f"quantity. Numerical variation in this feature can be used to "
+            f"identify unusually large, small, or otherwise atypical "
+            f"observations."
         )
-
     elif kind == "boolean":
         description = (
-            f"'{name}' is a boolean-style feature representing a "
-            f"binary state or condition. It may provide contextual "
-            f"information that helps distinguish normal observations "
-            f"from unusual ones."
+            f"'{name}' is a boolean-style feature representing a binary "
+            f"state or condition. It may provide contextual information "
+            f"that helps distinguish normal observations from unusual ones."
         )
-
     elif kind == "categorical":
         description = (
-            f"'{name}' is a categorical feature representing "
-            f"discrete groups, labels, or states. It can provide "
-            f"context for comparing observations within similar "
-            f"groups and may be useful for contextual anomaly "
-            f"detection."
+            f"'{name}' is a categorical feature representing discrete "
+            f"groups, labels, or states. It can provide context for "
+            f"comparing observations within similar groups and may be "
+            f"useful for contextual anomaly detection."
         )
-
     elif kind == "null_empty":
         description = (
-            f"'{name}' contains no usable non-null observations, "
-            f"so its semantic role cannot be reliably determined "
-            f"from the available dataset."
+            f"'{name}' contains no usable non-null observations, so its "
+            f"semantic role cannot be reliably determined from the "
+            f"available dataset."
         )
-
     else:
         description = (
-            f"'{name}' is classified as a {role.lower()}. "
-            f"Its usefulness for anomaly detection depends on how "
-            f"its values relate to the other features in the dataset."
+            f"'{name}' is classified as a {role.lower()}. Its usefulness "
+            f"for anomaly detection depends on how its values relate to "
+            f"the other features in the dataset."
         )
 
     if samples:
-        description += (
-            f" Representative values include: {samples}."
-        )
+        description += f" Representative values include: {samples}."
 
     description += (
-        f" The dataset currently contains {dataset_rows} records "
-        f"and {dataset_columns} columns, so this feature should be "
-        f"interpreted in the context of the overall dataset."
+        f" The dataset currently contains {dataset_rows} records and "
+        f"{dataset_columns} columns, so this feature should be interpreted "
+        f"in the context of the overall dataset."
     )
-
     return description
